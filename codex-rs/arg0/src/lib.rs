@@ -358,22 +358,7 @@ fn prepare_path_entry_for_codex_aliases(
         }
     }
 
-    std::fs::create_dir_all(&codex_home)?;
-    // Use a CODEX_HOME-scoped temp root to avoid cluttering the top-level directory.
-    let temp_root = codex_home.join("tmp").join("arg0");
-    std::fs::create_dir_all(&temp_root)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        // Ensure only the current user can access the temp directory.
-        std::fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))?;
-    }
-
-    // Best-effort cleanup of stale per-session dirs. Ignore failures so startup proceeds.
-    if let Err(err) = janitor_cleanup(&temp_root) {
-        eprintln!("WARNING: failed to clean up stale arg0 temp dirs: {err}");
-    }
+    let temp_root = prepare_arg0_temp_root(&codex_home, std::env::consts::OS)?;
 
     let temp_dir = tempfile::Builder::new()
         .prefix("codex-arg0")
@@ -450,6 +435,30 @@ fn prepare_path_entry_for_codex_aliases(
         Arg0PathEntryGuard::new(temp_dir, lock_file, paths),
         updated_path_env_var,
     ))
+}
+
+fn prepare_arg0_temp_root(codex_home: &Path, platform: &str) -> std::io::Result<PathBuf> {
+    // Windows and WSL can share CODEX_HOME, but their file locks do not exclude
+    // one another on DrvFS. Keep cleanup within each platform's namespace so a
+    // Windows process cannot delete the helpers held by a live WSL process.
+    // Legacy janitors skip these namespace directories because they have no
+    // .lock file directly inside them.
+    let temp_root = codex_home.join("tmp").join("arg0");
+    std::fs::create_dir_all(&temp_root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    let temp_root = temp_root.join(platform);
+    std::fs::create_dir_all(&temp_root)?;
+    if let Err(err) = janitor_cleanup(&temp_root) {
+        eprintln!("WARNING: failed to clean up stale arg0 temp dirs: {err}");
+    }
+
+    Ok(temp_root)
 }
 
 #[cfg(windows)]
@@ -542,6 +551,7 @@ mod tests {
     use super::LOCK_FILENAME;
     use super::janitor_cleanup;
     use super::linux_sandbox_exe_path;
+    use super::prepare_arg0_temp_root;
     #[cfg(unix)]
     use super::run_main_with_arg0_guard;
     #[cfg(unix)]
@@ -772,6 +782,51 @@ mod tests {
                 Ok(())
             },
         ))
+    }
+
+    #[test]
+    fn platform_cleanup_preserves_foreign_helpers() -> std::io::Result<()> {
+        let home = tempfile::tempdir()?;
+        let windows_root = prepare_arg0_temp_root(home.path(), "windows")?;
+        let foreign = windows_root.join("codex-arg0-windows");
+        fs::create_dir(&foreign)?;
+        create_lock(&foreign)?;
+        let foreign_helper = foreign.join("apply_patch.bat");
+        fs::write(&foreign_helper, "Windows helper")?;
+
+        let linux_root = prepare_arg0_temp_root(home.path(), "linux")?;
+        let stale = linux_root.join("codex-arg0-stale");
+        fs::create_dir(&stale)?;
+        create_lock(&stale)?;
+        fs::write(stale.join("codex-linux-sandbox"), "Linux helper")?;
+
+        prepare_arg0_temp_root(home.path(), "linux")?;
+
+        assert_eq!(fs::read_to_string(foreign_helper)?, "Windows helper");
+        assert!(!stale.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_cleanup_preserves_platform_namespaces() -> std::io::Result<()> {
+        let home = tempfile::tempdir()?;
+        let mut helpers = Vec::new();
+        for platform in ["linux", "windows"] {
+            let root = prepare_arg0_temp_root(home.path(), platform)?;
+            let dir = root.join("codex-arg0-session");
+            fs::create_dir(&dir)?;
+            create_lock(&dir)?;
+            let helper = dir.join("helper");
+            fs::write(&helper, platform)?;
+            helpers.push((helper, platform));
+        }
+
+        janitor_cleanup(&home.path().join("tmp").join("arg0"))?;
+
+        for (helper, platform) in helpers {
+            assert_eq!(fs::read_to_string(helper)?, platform);
+        }
+        Ok(())
     }
 
     #[test]
